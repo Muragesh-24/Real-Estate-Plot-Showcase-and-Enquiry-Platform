@@ -84,48 +84,35 @@ async function verifyTurnstile(token, ip) {
 
 async function checkRateLimit(key, limit, windowSeconds) {
   const now = Math.floor(Date.now() / 1000);
-  const expiresAt = now + windowSeconds;
+  const windowId = Math.floor(now / windowSeconds); // bucket id changes every window
+  const itemKey = `${key}#${windowId}`;
+  const expiresAt = (windowId + 1) * windowSeconds + 60; // +60s buffer for TTL cleanup
 
-  const existing = await dynamo.send(
-    new GetCommand({
-      TableName: process.env.RATE_LIMIT_TABLE,
-      Key: { key }
-    })
-  );
-
-  if (!existing.Item || existing.Item.expiresAt < now) {
-    await dynamo.send(
-      new PutCommand({
+  try {
+    const result = await dynamo.send(
+      new UpdateCommand({
         TableName: process.env.RATE_LIMIT_TABLE,
-        Item: {
-          key,
-          count: 1,
-          expiresAt
-        }
+        Key: { key: itemKey },
+        UpdateExpression: "SET #c = if_not_exists(#c, :zero) + :inc, expiresAt = :exp",
+        ConditionExpression: "attribute_not_exists(#c) OR #c < :limit",
+        ExpressionAttributeNames: { "#c": "count" },
+        ExpressionAttributeValues: {
+          ":inc": 1,
+          ":zero": 0,
+          ":limit": limit,
+          ":exp": expiresAt,
+        },
+        ReturnValues: "UPDATED_NEW",
       })
     );
-
     return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") {
+      return false; // limit reached
+    }
+    throw err;
   }
-
-  if (existing.Item.count >= limit) {
-    return false;
-  }
-
-  await dynamo.send(
-    new PutCommand({
-      TableName: process.env.RATE_LIMIT_TABLE,
-      Item: {
-        key,
-        count: existing.Item.count + 1,
-        expiresAt: existing.Item.expiresAt
-      }
-    })
-  );
-
-  return true;
 }
-
 async function saveEnquiry(data) {
   const enquiryId = crypto.randomUUID();
 
@@ -281,11 +268,11 @@ export const handler = async (event) => {
       message: "Enquiry submitted successfully. Mail sent.",
       enquiryId
     });
-  } catch (error) {
-    console.error("Lambda error:", error);
-
-    return response(500, {
-      message: error.message
-    });
-  }
+  } 
+  catch (error) {
+  console.error("Lambda error:", error); 
+  return response(500, {
+    message: "Something went wrong. Please try again later.",
+  });
+}
 };
